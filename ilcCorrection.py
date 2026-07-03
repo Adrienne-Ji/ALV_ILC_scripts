@@ -82,6 +82,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 from scipy.signal import butter, filtfilt
+from scipy.ndimage import gaussian_filter1d
 
 warnings.filterwarnings('ignore')
 
@@ -110,14 +111,29 @@ SIM_CASE = os.environ.get('ILC_CASE', 'healthy')
 
 ILC_READY_CSV = None     # None → sharedCSVs/ILCReadyData.csv
 
-ILC_ALPHA  = 0.55        # learning gain  (0 < α ≤ 1) — raised from 0.4: the confidence-blended
-                         # Jacobian + MAX_DELTA_U_MM cap now guard against bad-Jacobian instability
-                         # directly, so the learning rate itself doesn't need to carry that burden
-Q_CUTOFF   = 0.35        # Q-filter normalised cutoff — raised from 0.3, same reasoning
+ILC_ALPHA  = 0.55        # learning gain  (0 < α ≤ 1)
+Q_CUTOFF   = 0.35        # Q-filter normalised cutoff
 Q_ORDER    = 3
 
-USE_EMPIRICAL_JACOBIAN = True              # fit J_geom (Y=J·U+b) from session history instead of static FK
-GEOM_WEIGHTS = np.array([1.0, 0.5, 1.0])  # [twist, height, volume] — reduce height (already converging)
+GEOM_WEIGHTS = np.array([1.0, 0.5, 1.0])  # [twist, height, volume] — base weights (further modulated per phase)
+
+# When sensitivity to an output collapses at a phase point (e.g. ∂Volume/∂trans
+# → 0 at compression), adaptively reduce that output's correction weight at
+# that phase so effort is redirected to other actuators that DO have meaningful
+# sensitivity there, rather than pushing a near-zero channel.
+USE_ADAPTIVE_WEIGHTS = True   # scale per-phase GEOM_WEIGHTS by local J row norms
+SENSITIVITY_FLOOR    = 0.25   # minimum weight fraction even when sensitivity is near zero
+
+# Static FK Jacobian evaluation strategy:
+# The SINDy model is nonlinear — its gradient varies significantly across the
+# cardiac cycle (visualised in plotSINDyLocalGradient.py).  Assuming a single
+# constant value (evaluated at the mean operating point) loses this structure
+# and specifically misdirects Volume correction, where sensitivity collapses
+# to near-zero at peak compression but is large during filling.
+# Per-point evaluation restores local accuracy; Gaussian smoothing across
+# phase suppresses finite-difference noise that caused oscillation in the old
+# architecture without it.
+SINDY_SMOOTH_SIGMA = 4   # Gaussian sigma in phase samples (0 = no smoothing, raw per-point)
 
 # ── Confidence-blended geometry Jacobian ────────────────────────────────────
 # J_geom = w · J_empirical + (1−w) · J_static  — a SMOOTH blend, not a hard
@@ -140,18 +156,21 @@ FULL_TRUST_ITERS   = 10     # at/above this, w_n = 1 (pure empirical, if well-co
 GOOD_COND_NUMBER   = 1e2    # below this, w_cond = 1 (no penalty)
 MAX_COND_NUMBER    = 1e4    # at/above this, w_cond = 0 (reject regression entirely)
 
-# Hard cap on the per-iteration actuator correction, in physical mm — applied
-# regardless of which Jacobian (static FK or empirical) produced the update.
-# Safety net against an ill-conditioned Jacobian causing pinv() to blow up a
-# modest tracking error into a huge correction (most likely on the static FK
-# cold-start iteration, since that Jacobian's gradient scale isn't verified).
-MAX_DELTA_U_MM = 8.0
+# Soft safety cap on the per-iteration actuator correction — only triggers for
+# numerically extreme corrections (ill-conditioned Jacobian on a degenerate
+# session start).  Raised from 8mm: adaptive weights now handle the near-zero-
+# sensitivity case that was causing the original overcorrection, so the 8mm
+# cap was blocking legitimate large corrections at low-sensitivity phases.
+# Physical actuator limits (ACT_MIN/ACT_MAX) remain the true hard backstop.
+MAX_DELTA_U_MM = 20.0
 
 ACT_MIN = np.array([200.0, 202.0, 200.0])
 ACT_MAX = np.array([248.0, 248.0, 248.0])
 
-HEIGHT_OFFSET = 70.0     # mm
-VOLUME_OFFSET = 0.0     # mL
+# Calibration offsets — imported from rig_config.py (the single source of truth).
+# Change them there, not here, so plotILCConvergence.py and any other script
+# that compares measured vs desired automatically picks up the update.
+from rig_config import HEIGHT_OFFSET, VOLUME_OFFSET
 
 # Pressure weight — scales pressure row relative to geometry rows.
 # 0 = geometry only,  0.5 = moderate,  1.0 = equal weight.
@@ -161,6 +180,27 @@ VOLUME_OFFSET = 0.0     # mL
 # correction direction isn't trustworthy yet. Raise again once R²_P looks
 # more realistic (well under 1.0) with more session data.
 LAMBDA_P = 0.3
+
+# Pressure correction is ONLY active during IVC and IVR — the two isovolumic
+# phases where volume is constant but pressure changes sharply.  During
+# ejection (0.04–0.42) and filling (0.44–1.0), both volume AND pressure change
+# simultaneously: layering pressure correction on top of geometry correction
+# creates direct conflicts (the two rows of the augmented Jacobian can push
+# actuators in opposite directions for volume vs pressure).  Gating to
+# isovolumic phases removes this conflict entirely.
+IVC_PHASE          = (0.00, 0.04)   # Isovolumic Contraction: pressure RISES here.
+                                    # Conflict ratio 0.656 (above baseline 0.499) — some
+                                    # geometry disturbance accepted as the clinical trade-off
+                                    # for correct pressure RISE TIMING.  The geometry
+                                    # convergence gate ensures geometry is already PASS
+                                    # before this ever fires, so the absolute disturbance
+                                    # during 4% of the cycle is small and acceptable.
+IVR_PHASE          = (0.42, 0.44)   # Isovolumic Relaxation: pressure DROPS here.
+                                    # Conflict ratio 0.312 (global minimum) — lowest
+                                    # geometry disturbance per unit pressure correction.
+PRESSURE_FADE_SIGMA = 1.5           # Gaussian sigma (phase samples) for the smooth
+                                    # lambda fade at window boundaries — avoids hard
+                                    # steps in delta_u that would kink the trajectory
 
 # Reference for pressure error normalisation (peak-to-peak expected mmHg)
 P_NORM_REF = 125.0
@@ -411,73 +451,12 @@ else:
     print(f"  Only {len(U_reg_list)} iteration file(s) found — need ≥{REGRESSION_FLOOR} — "
           f"pressure correction disabled (λ=0, geometry only).")
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EMPIRICAL GEOMETRY JACOBIAN FROM ITERATION HISTORY
-#
-# Fit directly as  Y = J·U + b  (absolute regression, not consecutive deltas).
-# This pools ALL (actuator, geometry) points across the whole session — including
-# other trajectory cases run the same day. The actuator→deformation sensitivity
-# is a property of the physical device that day, not of which target trajectory
-# was being chased, so mixing cases only adds useful actuator-space diversity.
-# (The desired trajectory used for the ILC error itself stays case-specific via
-# ENG_CSV — only the Jacobian fit pools across cases.)
-# ══════════════════════════════════════════════════════════════════════════════
-J_geom_empirical = None
-J_geom_bias      = None
-_geom_cond       = None   # conditioning of the fit, used later to weight the blend
-_n_sources       = 0
-if USE_EMPIRICAL_JACOBIAN and EXP_DATA.exists():
-    print("\nFitting empirical geometry Jacobian from session history (pooled across cases) …")
-    _GRID = np.linspace(0, 1, 51)
-    _act_list, _geom_list = [], []
-
-    for _fpath in EXP_DATA.rglob('ILCReadyData.csv'):
-        _df  = pd.read_csv(_fpath)
-        _ce  = _find_col_df(_df, ['epi_mm',  'epi'])
-        _ct  = _find_col_df(_df, ['trans_mm','trans'])
-        _cn  = _find_col_df(_df, ['endo_mm', 'endo'])
-        _cw  = _find_col_df(_df, ['twist',   'twist_deg'])
-        _ch  = _find_col_df(_df, ['height',  'height_mm'])
-        _cv  = _find_col_df(_df, ['volume',  'volume_mL'])
-        _cph = _find_col_df(_df, ['phase','cycle_phase','time','time_s'])
-        if any(c is None for c in [_ce, _ct, _cn, _cw, _ch, _cv]):
-            continue
-        _ph = _df[_cph].values if _cph else np.linspace(0, 1, len(_df))
-        if _ph.max() > 1.5:
-            _ph = (_ph - _ph[0]) / (_ph[-1] - _ph[0])
-        def _rs(v):
-            return interp1d(_ph, v, kind='linear',
-                            bounds_error=False, fill_value='extrapolate')(_GRID)
-        _act_list.append(np.column_stack([_rs(_df[_ce].values), _rs(_df[_ct].values), _rs(_df[_cn].values)]))
-        _geom_list.append(np.column_stack([_rs(_df[_cw].values), _rs(_df[_ch].values), _rs(_df[_cv].values)]))
-        _n_sources += 1
-
-    if _n_sources >= REGRESSION_FLOOR:
-        _act_all  = np.vstack(_act_list)    # [n_sources*51, 3]
-        _geom_all = np.vstack(_geom_list)   # [n_sources*51, 3]
-        A_act = np.column_stack([_act_all, np.ones(len(_act_all))])   # [N, 4] — bias column
-        _geom_cond = np.linalg.cond(A_act)
-
-        coeffs, _, _, _  = np.linalg.lstsq(A_act, _geom_all, rcond=None)   # (4, 3)
-        J_geom_empirical = coeffs[:3, :].T   # (3,3): rows=outputs, cols=actuators
-        J_geom_bias      = coeffs[3, :]      # (3,): per-output bias
-
-        _w_iter = _iter_weight(_n_sources)
-        _w_cond = _cond_weight(_geom_cond)
-        print(f"  Empirical J: {_n_sources} iteration files pooled, {len(_act_all)} pts, "
-              f"cond={_geom_cond:.1e}  (iter-confidence={_w_iter:.2f}, cond-confidence={_w_cond:.2f}, "
-              f"blend weight={_w_iter*_w_cond:.2f})")
-        _pred_all = A_act @ coeffs
-        for ci, _nm in enumerate(['Twist ', 'Height', 'Volume']):
-            _ss_res = np.sum((_geom_all[:, ci] - _pred_all[:, ci])**2)
-            _ss_tot = np.sum((_geom_all[:, ci] - _geom_all[:, ci].mean())**2)
-            _r2 = 1 - _ss_res / _ss_tot if _ss_tot > 0 else 0.0
-            print(f"    {_nm}  R²={_r2:.3f}  "
-                  f"epi={J_geom_empirical[ci,0]:+.3f}  trans={J_geom_empirical[ci,1]:+.3f}  "
-                  f"endo={J_geom_empirical[ci,2]:+.3f}  bias={J_geom_bias[ci]:+.2f}")
-    else:
-        print(f"  Only {_n_sources} iteration file(s) found — need ≥{REGRESSION_FLOOR} — "
-              f"using static FK Jacobian only")
+# Geometry Jacobian source: SINDy per-point (smoothed) only.
+# Fourier/linear regression from session data was removed — regression from
+# closed-loop ILC data risks fitting ILC-history artefacts rather than the
+# true physical actuator→geometry sensitivity, and SINDy per-point (smoothed)
+# empirically achieved geometry convergence on 6_18 without any data-driven
+# geometry regression.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DESIRED TRAJECTORY
@@ -608,60 +587,176 @@ for ci, (col, unit) in enumerate(zip(OUTPUT_NAMES, OUTPUT_UNITS)):
     rmse_before[col] = rmse
     print(f"    {col:<14}: RMSE = {rmse:.4f} {unit}")
 p_rmse_before = np.sqrt(np.mean(e_p**2))
-print(f"    {'Pressure':<14}: RMSE = {p_rmse_before:.2f} mmHg  "
-      f"(λ={'disabled' if LAMBDA_P_EFF == 0 else LAMBDA_P_EFF})")
+print(f"    {'Pressure':<14}: RMSE = {p_rmse_before:.2f} mmHg")
+
+# ── Geometry-convergence gate for pressure correction ─────────────────────────
+# Pressure correction only unlocks once geometry has converged (all outputs
+# below their RMSE thresholds).  Primary goal is geometry accuracy; pressure
+# has a much wider acceptable error margin and its correction row can conflict
+# with geometry correction when geometry is still far off target.
+# Phase-specific gating (IVC + IVR only) is applied per-phase-point in the
+# ILC loop below — this gate is the session-level prerequisite.
+_geom_converged = all(rmse_before[col] < GEOMETRY_RMSE_THRESHOLD[col]
+                      for col in OUTPUT_NAMES)
+
+if not _geom_converged and LAMBDA_P_EFF > 0:
+    print(f"\n  Pressure correction HELD OFF — geometry not yet converged:")
+    for col in OUTPUT_NAMES:
+        status = 'PASS' if rmse_before[col] < GEOMETRY_RMSE_THRESHOLD[col] else 'FAIL'
+        print(f"    [{status}] {col}: {rmse_before[col]:.3f} (threshold {GEOMETRY_RMSE_THRESHOLD[col]})")
+    LAMBDA_P_EFF = 0.0
+elif _geom_converged and LAMBDA_P_EFF > 0:
+    print(f"\n  Geometry converged — pressure correction ACTIVE  "
+          f"λ={LAMBDA_P_EFF:.3f}  (IVC {IVC_PHASE} + IVR {IVR_PHASE} phases only)")
+else:
+    print(f"\n  Pressure correction inactive  (λ=0)")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ILC UPDATE
 # ══════════════════════════════════════════════════════════════════════════════
 pressure_active = LAMBDA_P_EFF > 0 and _COL_PRES is not None
-mode_str = f"geometry + pressure (λ={LAMBDA_P_EFF})" if pressure_active \
-           else "geometry only (no history data yet)"
+if pressure_active:
+    mode_str = (f"geometry + pressure — geometry converged, "
+                f"λ={LAMBDA_P_EFF:.3f} at IVC/IVR only")
+elif _geom_converged:
+    mode_str = "geometry only — pressure inactive (no history data)"
+else:
+    mode_str = "geometry only — pressure held off (geometry not yet converged)"
 print(f"\nComputing ILC correction  [{mode_str}] …")
 
 delta_u_n = np.zeros_like(act_n_avg)
 
-# Static FK Jacobian: evaluate ONCE at the trajectory's mean operating point
-# and reuse it for every phase point (not per phase point — see earlier note
-# on why pointwise finite-difference evaluation is noisy/oscillatory).
-# Always computed now, since it's blended with the empirical fit rather than
-# being a pure fallback.
-J_geom_static = jacobian_at(act_n_avg.mean(axis=0), actual_p_n.mean())
+# Static FK Jacobian — phase-varying, Gaussian-smoothed:
+# The SINDy model is nonlinear, so its gradient changes significantly across
+# the cardiac cycle (e.g. volume sensitivity via trans collapses to near-zero
+# at peak compression, then rises to 0.5 during filling). A single constant
+# evaluated at the mean operating point loses this structure and specifically
+# misdirects the volume correction. Per-point evaluation restores local
+# accuracy; Gaussian smoothing (sigma=SINDY_SMOOTH_SIGMA phase samples)
+# removes the finite-difference noise that caused oscillation without it.
+_J_static_raw = np.zeros((n_traj, 3, 3))
+for _i in range(n_traj):
+    _J_static_raw[_i] = jacobian_at(act_n_avg[_i], actual_p_n[_i])
 
-if J_geom_empirical is not None:
-    _w_blend = _iter_weight(_n_sources) * _cond_weight(_geom_cond)
+if SINDY_SMOOTH_SIGMA > 0:
+    _J_static_all = np.zeros_like(_J_static_raw)
+    for _oi in range(3):
+        for _ci in range(3):
+            _J_static_all[:, _oi, _ci] = gaussian_filter1d(
+                _J_static_raw[:, _oi, _ci], sigma=SINDY_SMOOTH_SIGMA, mode='wrap')
 else:
-    _w_blend = 0.0
-    J_geom_empirical = np.zeros((3, 3))   # unused at w=0, just avoids a branch below
+    _J_static_all = _J_static_raw
 
-J_geom = _w_blend * J_geom_empirical + (1 - _w_blend) * J_geom_static
-print(f"\n  Geometry Jacobian blend weight: {_w_blend:.2f}  "
-      f"({'mostly/fully empirical' if _w_blend > 0.7 else 'mostly/fully static FK' if _w_blend < 0.3 else 'blended'})")
-for _ci, _nm in enumerate(['Twist ', 'Height', 'Volume']):
-    print(f"    ∂{_nm}/∂u  epi={J_geom[_ci,0]:+.4f}  trans={J_geom[_ci,1]:+.4f}  endo={J_geom[_ci,2]:+.4f}")
+# Geometry Jacobian: smoothed SINDy per-point (no data-driven regression blend)
+print(f"\n  Geometry Jacobian: SINDy per-point, smoothed σ={SINDY_SMOOTH_SIGMA}"
+      + ("  (adaptive weights ON)" if USE_ADAPTIVE_WEIGHTS else ""))
+
+# Pre-compute adaptive weight maps
+if USE_ADAPTIVE_WEIGHTS:
+    _row_norms = np.linalg.norm(_J_static_all, axis=2)          # (n_traj, 3)
+    _row_max   = _row_norms.max(axis=0, keepdims=True) + 1e-8
+    _adaptive_w = (_row_norms / _row_max) * (1 - SENSITIVITY_FLOOR) + SENSITIVITY_FLOOR
+    _adaptive_w = _adaptive_w * GEOM_WEIGHTS[None, :]
+
+_J_geom_all = _J_static_all   # no blending — SINDy smoothed is the geometry Jacobian
+
+# ── Smooth phase-varying lambda envelope for pressure ─────────────────────────
+# A hard binary gate (0 outside IVC/IVR, 1 inside) creates step changes in
+# lambda_i → step changes in delta_u_n → kinks in the corrected trajectory.
+# Fix: Gaussian-filter the hard gate with mode='wrap' so all boundaries fade
+# smoothly and the cycle wraps continuously (IVC at phi=0 connects to phi≈1).
+_lambda_hard = np.array([
+    1.0 if (IVC_PHASE[0] <= p <= IVC_PHASE[1] or IVR_PHASE[0] <= p <= IVR_PHASE[1])
+    else 0.0
+    for p in traj_phase
+])
+_lambda_envelope = gaussian_filter1d(_lambda_hard, sigma=PRESSURE_FADE_SIGMA, mode='wrap')
+# _lambda_envelope is now in [0,1] with smooth fades at every IVC/IVR boundary
+
+peak_lambda = _lambda_envelope.max()
+n_nonzero = int(np.sum(_lambda_envelope > 0.01))
+print(f"  Pressure lambda envelope: peak={peak_lambda:.3f}  "
+      f"non-trivial at {n_nonzero}/{n_traj} pts  "
+      f"(IVC {IVC_PHASE} + IVR {IVR_PHASE}, fade σ={PRESSURE_FADE_SIGMA} samples)")
 
 for i in range(n_traj):
-    if pressure_active:
+    J_geom = _J_geom_all[i]
+    geom_w_i = _adaptive_w[i] if USE_ADAPTIVE_WEIGHTS else GEOM_WEIGHTS
+
+    # Smoothly-varying lambda — zero outside isovolumic phases, fades in/out
+    # at boundaries so there are no discontinuities in the correction signal.
+    lambda_i = LAMBDA_P_EFF * _lambda_envelope[i] if pressure_active else 0.0
+
+    if lambda_i > 1e-6:
         J_pres = J_pres_at_phase(traj_phase[i], fourier_coeffs, N_FOURIER)
-        J_aug  = np.vstack([J_geom, LAMBDA_P_EFF * J_pres])       # (4, 3)
-        e_aug  = np.append(e_norm[i], e_p_norm[i])                # (4,)
-        w_full = np.append(GEOM_WEIGHTS, 1.0)                     # pressure row weight=1
+
+        # Phase-specific geometry weights for the pressure-active phases.
+        # IVC and IVR are ISOVOLUMIC — volume is near-constant BY PHYSIOLOGICAL
+        # DEFINITION.  Keeping the volume weight non-zero during those phases
+        # forces the pseudoinverse to simultaneously protect something that isn't
+        # changing anyway, creating unnecessary conflict with pressure correction.
+        # Zero-weighting the physiologically-stationary outputs frees the
+        # corresponding degrees of freedom for pressure correction.
+        #
+        # IVC (0–4%): volume strictly constant → release volume constraint
+        #   geom_w: [twist, height, volume=0]
+        # IVR (42–44%): volume + height near-constant → release both
+        #   geom_w: [twist, height=0, volume=0]
+        #
+        # Note: no extra smoothing needed — the lambda_envelope Gaussian fade
+        # already smooths the pressure correction magnitude near the boundaries,
+        # so the hard weight switch at the window edges doesn't cause trajectory kinks.
+        phi_i = traj_phase[i]
+        if IVC_PHASE[0] <= phi_i <= IVC_PHASE[1]:
+            geom_w_p = geom_w_i * np.array([1.0, 1.0, 0.0])  # twist+height only
+        elif IVR_PHASE[0] <= phi_i <= IVR_PHASE[1]:
+            geom_w_p = geom_w_i * np.array([1.0, 0.0, 0.0])  # twist only
+        else:
+            geom_w_p = geom_w_i
+
+        J_aug  = np.vstack([J_geom, lambda_i * J_pres])           # (4, 3)
+        e_aug  = np.append(e_norm[i], e_p_norm[i])
+        w_full = np.append(geom_w_p, 1.0)
     else:
-        J_aug  = J_geom                                            # (3, 3)
-        e_aug  = e_norm[i]                                         # (3,)
-        w_full = GEOM_WEIGHTS
+        J_aug  = J_geom
+        e_aug  = e_norm[i]
+        w_full = geom_w_i
 
     J_w = J_aug * w_full[:, None]
     e_w = e_aug * w_full
     delta_u_n[i] = ILC_ALPHA * np.linalg.pinv(J_w) @ e_w
 
-# ── Hard cap on correction magnitude (mm) — catches an ill-conditioned Jacobian
-delta_u_max_n = MAX_DELTA_U_MM / x_den[:3]
-n_clamped     = np.sum(np.abs(delta_u_n) > delta_u_max_n)
+# ── Hard cap + cross-actuator redistribution ──────────────────────────────────
+# When an actuator's correction is clamped (hits ±MAX_DELTA_U_MM), the output
+# error that actuator was meant to address remains uncorrected.  Redistribute
+# that residual to the unclamped actuators at each phase point using a
+# reduced-dimension solve on the same blended Jacobian.
+delta_u_max_n  = MAX_DELTA_U_MM / x_den[:3]
+delta_u_n_raw  = delta_u_n.copy()
+delta_u_n      = np.clip(delta_u_n_raw, -delta_u_max_n, delta_u_max_n)
+
+n_clamped = int(np.sum(np.abs(delta_u_n_raw) > delta_u_max_n))
+n_redistributed = 0
+for i in range(n_traj):
+    clipped = np.abs(delta_u_n_raw[i]) > delta_u_max_n
+    if not clipped.any():
+        continue
+    free = ~clipped
+    if not free.any():
+        continue
+    J_i = _J_geom_all[i]                              # (3, 3)
+    e_residual = J_i @ delta_u_n_raw[i] - J_i @ delta_u_n[i]  # output error lost to clamping
+    J_free = J_i[:, free]                             # (3, n_free)
+    extra, _, _, _ = np.linalg.lstsq(J_free, e_residual, rcond=None)
+    delta_u_n[i, free] = np.clip(
+        delta_u_n[i, free] + extra,
+        -delta_u_max_n[free], delta_u_max_n[free]
+    )
+    n_redistributed += 1
+
 if n_clamped > 0:
-    print(f"  WARNING: {n_clamped} actuator/phase corrections exceeded "
-          f"±{MAX_DELTA_U_MM} mm and were clamped — Jacobian may be poorly scaled.")
-delta_u_n = np.clip(delta_u_n, -delta_u_max_n, delta_u_max_n)
+    print(f"  Correction cap: {n_clamped} actuator×phase entries clamped to ±{MAX_DELTA_U_MM} mm  "
+          f"({n_redistributed} phase pts had residual redistributed to free actuators)")
 
 v_k = act_n_avg + delta_u_n
 
@@ -678,11 +773,13 @@ act_phys_new = denorm_act(act_n_new)
 act_phys_new = np.clip(act_phys_new, ACT_MIN.reshape(1,-1), ACT_MAX.reshape(1,-1))
 
 # ── Geometry prediction ───────────────────────────────────────────────────────
-# Linearised prediction using the SAME blended Jacobian used for the correction:
-# y_new ≈ y_current + J_geom · Δu  (valid for any blend weight, static→empirical)
-delta_u_phys      = act_phys_new - act_phys_avg
-y_phys_corrected  = y_phys_avg + delta_u_phys @ J_geom.T
-_pred_method      = f"blended Jacobian (weight={_w_blend:.2f})"
+# Phase-varying linearised prediction using the SAME per-phase blended Jacobian
+# that drove the correction: y_norm_new[i] ≈ y_norm_current[i] + J[i] · Δu_norm[i]
+_J_blend_all = _J_geom_all   # already computed before the ILC loop
+delta_u_norm_pred = act_n_new - act_n_avg                   # (n, 3), normalised
+y_norm_corrected  = norm_y(y_phys_avg) + np.einsum('noc,nc->no', _J_blend_all, delta_u_norm_pred)
+y_phys_corrected  = denorm_y(y_norm_corrected)
+_pred_method      = f"SINDy per-point smoothed (σ={SINDY_SMOOTH_SIGMA})"
 e_corrected = traj_phys - y_phys_corrected
 
 print(f"\n  Predicted geometry after correction [{_pred_method}]:")

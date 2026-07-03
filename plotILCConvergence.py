@@ -87,8 +87,7 @@ eng        = pd.read_csv(ENG_CSV)
 traj_time  = eng['time'].values
 traj_phase = (traj_time - traj_time[0]) / (traj_time[-1] - traj_time[0])
 
-HEIGHT_OFFSET = 70.0
-VOLUME_OFFSET = 15.0
+from rig_config import HEIGHT_OFFSET, VOLUME_OFFSET   # single source of truth
 
 desired = {
     'twist':    eng['twist'].values,
