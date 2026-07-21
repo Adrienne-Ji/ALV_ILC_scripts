@@ -76,7 +76,9 @@ Outputs
   saved_models/ilc_history/iter{k}_Xraw.csv
 """
 
-import os, pickle, pathlib, re, warnings
+import os, sys, pickle, pathlib, re, warnings
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -115,7 +117,7 @@ ILC_ALPHA  = 0.55        # learning gain  (0 < α ≤ 1)
 Q_CUTOFF   = 0.35        # Q-filter normalised cutoff
 Q_ORDER    = 3
 
-GEOM_WEIGHTS = np.array([1.0, 0.5, 1.0])  # [twist, height, volume] — base weights (further modulated per phase)
+GEOM_WEIGHTS = np.array([1.0, 1.0, 1.0])  # [twist, height, volume] — equal weights, geometry-only phase
 
 # When sensitivity to an output collapses at a phase point (e.g. ∂Volume/∂trans
 # → 0 at compression), adaptively reduce that output's correction weight at
@@ -156,6 +158,13 @@ FULL_TRUST_ITERS   = 10     # at/above this, w_n = 1 (pure empirical, if well-co
 GOOD_COND_NUMBER   = 1e2    # below this, w_cond = 1 (no penalty)
 MAX_COND_NUMBER    = 1e4    # at/above this, w_cond = 0 (reject regression entirely)
 
+# Condition number cap for the per-point SINDy Jacobian used inside the ILC
+# update loop.  The SINDy polynomial can become near-singular at boundary
+# operating points (e.g. trans at its 202mm floor).  Truncated SVD via pinv(rcond)
+# zeros out singular values below s_max/SINDY_COND_MAX, preventing the pseudo-
+# inverse from amplifying noise into 100s-of-mm raw corrections.
+SINDY_COND_MAX = 300.0   # rcond = 1/300 — singular values <0.33% of max are zeroed
+
 # Soft safety cap on the per-iteration actuator correction — only triggers for
 # numerically extreme corrections (ill-conditioned Jacobian on a degenerate
 # session start).  Raised from 8mm: adaptive weights now handle the near-zero-
@@ -163,6 +172,21 @@ MAX_COND_NUMBER    = 1e4    # at/above this, w_cond = 0 (reject regression entir
 # cap was blocking legitimate large corrections at low-sensitivity phases.
 # Physical actuator limits (ACT_MIN/ACT_MAX) remain the true hard backstop.
 MAX_DELTA_U_MM = 20.0
+
+# Actuator preference weights for cross-actuator redistribution.
+# When one actuator saturates, the residual correction is distributed to the
+# others weighted by these values — higher weight = more preferred receiver.
+# Trans has a naturally smaller operating range vs epi/endo in this rig and is
+# already the primary volume driver (near ceiling during expansion), so it gets
+# a LOW redistribution weight.  Endo is favoured (∂Height/∂endo=0.60 is large,
+# good sensitivity for absorbing redistributed height/twist correction).
+REDIST_ACT_WEIGHTS = np.array([1.0, 0.2, 1.5])  # [epi, trans, endo]
+
+# Per-actuator alpha scale — multiplicative factor on each actuator's correction
+# independently of the global ILC_ALPHA.  Reverted trans to 1.0: oscillation is
+# now addressed by the 50-pt resolution limit in ILCReadyData; keeping trans at
+# 0.4 was preventing it from using the limited headroom it has before saturation.
+ACT_ALPHA_SCALE = np.array([1.0, 0.75, 1.0])   # [epi, trans, endo] — trans dampened to prevent iterative drift
 
 ACT_MIN = np.array([200.0, 202.0, 200.0])
 ACT_MAX = np.array([248.0, 248.0, 248.0])
@@ -179,7 +203,7 @@ from rig_config import HEIGHT_OFFSET, VOLUME_OFFSET
 # (too few diverse iterations for the Fourier regression), so this row's
 # correction direction isn't trustworthy yet. Raise again once R²_P looks
 # more realistic (well under 1.0) with more session data.
-LAMBDA_P = 0.3
+LAMBDA_P = 0.08  # geometry converged — pressure enabled; λ_eff ≈ 0.044 at 6 files, grows to 0.08 at 10 files
 
 # Pressure correction is ONLY active during IVC and IVR — the two isovolumic
 # phases where volume is constant but pressure changes sharply.  During
@@ -188,19 +212,10 @@ LAMBDA_P = 0.3
 # creates direct conflicts (the two rows of the augmented Jacobian can push
 # actuators in opposite directions for volume vs pressure).  Gating to
 # isovolumic phases removes this conflict entirely.
-IVC_PHASE          = (0.00, 0.04)   # Isovolumic Contraction: pressure RISES here.
-                                    # Conflict ratio 0.656 (above baseline 0.499) — some
-                                    # geometry disturbance accepted as the clinical trade-off
-                                    # for correct pressure RISE TIMING.  The geometry
-                                    # convergence gate ensures geometry is already PASS
-                                    # before this ever fires, so the absolute disturbance
-                                    # during 4% of the cycle is small and acceptable.
-IVR_PHASE          = (0.42, 0.44)   # Isovolumic Relaxation: pressure DROPS here.
-                                    # Conflict ratio 0.312 (global minimum) — lowest
-                                    # geometry disturbance per unit pressure correction.
-PRESSURE_FADE_SIGMA = 1.5           # Gaussian sigma (phase samples) for the smooth
-                                    # lambda fade at window boundaries — avoids hard
-                                    # steps in delta_u that would kink the trajectory
+IVC_PHASE          = (0.00, 0.30)   # IVC + full ejection (pressure rising + peak)
+IVR_PHASE          = (0.30, 0.60)   # IVR + early filling (pressure dropping)
+PRESSURE_FADE_SIGMA = 12.0          # Wide Gaussian — two windows nearly merge, transitions
+                                    # gradual over ~12% of cycle, no hard boundary jolts
 
 # Reference for pressure error normalisation (peak-to-peak expected mmHg)
 P_NORM_REF = 125.0
@@ -212,12 +227,32 @@ P_NORM_REF = 125.0
 # count (16→10) and reduce overfitting risk while history is still thin)
 N_FOURIER = 1
 
+# Unified RMSE pass standard — 10% of desired trajectory span (Twist=17deg, Height=18mm, Volume=60mL).
 GEOMETRY_RMSE_THRESHOLD = {
-    'Twist_deg': 1.0,    # deg
-    'Height_mm': 2.0,    # mm
-    'Volume_mL': 5.0,    # mL
+    'Twist_deg': 1.7,    # deg  (10% × 16.93 deg span)
+    'Height_mm': 1.8,    # mm   (10% × 18.0 mm span)
+    'Volume_mL': 6.0,    # mL   (10% × 60 mL span)
+}
+GEOMETRY_R2_THRESHOLD = {
+    'Twist_deg': 0.90,
+    'Height_mm': 0.95,
+    'Volume_mL': 0.95,
+}
+
+# Pressure gate uses the same standard — no separate looser threshold.
+PRESSURE_GATE_RMSE = GEOMETRY_RMSE_THRESHOLD
+PRESSURE_GATE_R2 = {
+    'Twist_deg': 0.80,
+    'Height_mm': 0.80,
+    'Volume_mL': 0.85,
 }
 PRESSURE_RMSE_THRESHOLD = 5.0   # mmHg
+
+# Shape-preserving error weight — adds slope mismatch between adjacent phase points
+# to the ILC error so the correction optimises waveform shape, not just pointwise values.
+#   0.0 = pure pointwise (current behaviour)
+#   0.3 = balanced (shape matters as much as ~1/3 of the value error)
+SHAPE_WEIGHT = 0.0   # disabled — interacts badly with pressure correction at wide windows
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PATHS
@@ -433,12 +468,11 @@ if len(U_reg_list) >= REGRESSION_FLOOR:
                          np.sum((P_reg_n - P_reg_n.mean())**2)
     n_reg_pts      = len(U_reg_all)
 
-    _w_pres        = _iter_weight(len(U_reg_list))   # smooth ramp, not a hard cutover
-    LAMBDA_P_EFF   = LAMBDA_P * _w_pres
+    LAMBDA_P_EFF   = LAMBDA_P   # fixed once Jacobian is fitted — no ramp; latch handles activation timing
 
     print(f"  Fourier regression: {len(U_reg_list)} iteration files, {n_reg_pts} pts, "
           f"{A_reg.shape[1]} features  R²={r2:.3f}  N_FOURIER={N_FOURIER}  "
-          f"confidence={_w_pres:.2f}  λ_eff={LAMBDA_P_EFF:.3f}")
+          f"λ={LAMBDA_P_EFF:.3f} (fixed — sudden switch via latch)")
     for _phi, _lbl in [(0.0,'start'), (0.25,'systole'), (0.5,'mid'), (0.75,'diastole')]:
         _j = J_pres_at_phase(_phi, fourier_coeffs, N_FOURIER)[0]
         print(f"    φ={_phi:.2f} ({_lbl}):  "
@@ -470,6 +504,21 @@ traj_v     = eng['volume'].values + VOLUME_OFFSET
 traj_phys  = np.stack([traj_twist, traj_h, traj_v], axis=1)
 traj_norm  = norm_y(traj_phys)
 pressure_n = (traj_p - x_min[3]) / x_den[3]
+
+# Error weighting fix: y_den comes from FK training range (twist=92.6 deg,
+# vol=197 mL) which far exceeds the desired trajectory swing (~10 deg, ~60 mL).
+# Dividing by y_den makes small-range outputs appear tiny — the ILC underweights
+# them. Correct by scaling GEOM_WEIGHTS by y_den/traj_range so each output's
+# emphasis is proportional to its fraction of the DESIRED trajectory range.
+# Normalise so the smallest discrepancy output stays at its original weight.
+_traj_range   = np.maximum(np.ptp(traj_phys, axis=0), 1e-6)   # (3,) peak-to-peak
+_traj_w_scale = y_den / _traj_range                            # (3,) boost factors
+_traj_w_scale = _traj_w_scale / _traj_w_scale.min()           # normalise: min→1
+_traj_w_scale = np.minimum(_traj_w_scale, 3.0)                # cap at 3× — prevents
+                                                               # over-boosting oscillation
+print(f"  Traj-range weight scale (capped at 3×): "
+      f"twist×{_traj_w_scale[0]:.2f}  height×{_traj_w_scale[1]:.2f}  volume×{_traj_w_scale[2]:.2f}"
+      f"  (traj swing: {_traj_range[0]:.1f} deg / {_traj_range[1]:.1f} mm / {_traj_range[2]:.1f} mL)")
 
 traj_phase = (traj_time - traj_time[0]) / (traj_time[-1] - traj_time[0])
 n_traj     = len(traj_time)
@@ -582,31 +631,52 @@ act_n_avg = norm_act(act_phys_avg)
 
 print(f"\n  Tracking error BEFORE correction (iteration {ITER_NUMBER}):")
 rmse_before = {}
+r2_before   = {}
 for ci, (col, unit) in enumerate(zip(OUTPUT_NAMES, OUTPUT_UNITS)):
-    rmse = np.sqrt(np.mean(e_phys[:, ci]**2))
+    des  = traj_phys[:, ci]
+    meas = y_phys_avg[:, ci]
+    rmse = np.sqrt(np.mean((des - meas)**2))
+    # Pearson r² — shape-only correlation, insensitive to DC offset.
+    # A waveform with the right shape but a constant vertical shift gives r²=1.0.
+    # Use this for the shape gate; RMSE handles the absolute level separately.
+    r    = float(np.corrcoef(des, meas)[0, 1])
+    r2   = r**2
     rmse_before[col] = rmse
-    print(f"    {col:<14}: RMSE = {rmse:.4f} {unit}")
+    r2_before[col]   = r2
+    print(f"    {col:<14}: RMSE = {rmse:.4f} {unit}   r² = {r2:.4f}")
 p_rmse_before = np.sqrt(np.mean(e_p**2))
 print(f"    {'Pressure':<14}: RMSE = {p_rmse_before:.2f} mmHg")
 
-# ── Geometry-convergence gate for pressure correction ─────────────────────────
-# Pressure correction only unlocks once geometry has converged (all outputs
-# below their RMSE thresholds).  Primary goal is geometry accuracy; pressure
-# has a much wider acceptable error margin and its correction row can conflict
-# with geometry correction when geometry is still far off target.
-# Phase-specific gating (IVC + IVR only) is applied per-phase-point in the
-# ILC loop below — this gate is the session-level prerequisite.
-_geom_converged = all(rmse_before[col] < GEOMETRY_RMSE_THRESHOLD[col]
-                      for col in OUTPUT_NAMES)
+# ── Geometry-convergence gate for pressure correction (one-way latch) ─────────
+# Once geometry passes the RMSE gate for the first time in a session, pressure
+# stays permanently active — re-evaluating every iteration creates geometry↔
+# pressure oscillation at the boundary.  The latch is stored as a flag file so
+# it persists across script invocations within the same session.
+_PRESSURE_LATCH = SAVE_DIR / f"pressure_unlocked_{SESSION_DIR}_{SIM_CASE}.flag"
 
-if not _geom_converged and LAMBDA_P_EFF > 0:
-    print(f"\n  Pressure correction HELD OFF — geometry not yet converged:")
-    for col in OUTPUT_NAMES:
-        status = 'PASS' if rmse_before[col] < GEOMETRY_RMSE_THRESHOLD[col] else 'FAIL'
-        print(f"    [{status}] {col}: {rmse_before[col]:.3f} (threshold {GEOMETRY_RMSE_THRESHOLD[col]})")
+_geom_passes_now = all(
+    rmse_before[col] < PRESSURE_GATE_RMSE[col]
+    for col in OUTPUT_NAMES)
+
+if _geom_passes_now and not _PRESSURE_LATCH.exists():
+    _PRESSURE_LATCH.touch()
+    print(f"\n  Geometry passed gate — pressure latch SET for session {SESSION_DIR}/{SIM_CASE}")
+
+_pressure_unlocked = _PRESSURE_LATCH.exists()
+_geom_converged    = _pressure_unlocked   # alias kept for downstream references
+
+for col in OUTPUT_NAMES:
+    rmse_ok = rmse_before[col] < PRESSURE_GATE_RMSE[col]
+    status  = 'PASS' if rmse_ok else 'FAIL'
+    print(f"    [{status}] {col}: RMSE={rmse_before[col]:.3f}  (gate {PRESSURE_GATE_RMSE[col]})"
+          f"  r²={r2_before[col]:.3f}")
+
+if not _pressure_unlocked and LAMBDA_P_EFF > 0:
+    print(f"\n  Pressure correction HELD OFF — geometry gate not yet passed "
+          f"(delete {_PRESSURE_LATCH.name} to reset latch)")
     LAMBDA_P_EFF = 0.0
-elif _geom_converged and LAMBDA_P_EFF > 0:
-    print(f"\n  Geometry converged — pressure correction ACTIVE  "
+elif _pressure_unlocked and LAMBDA_P_EFF > 0:
+    print(f"\n  Pressure correction ACTIVE (latch held)  "
           f"λ={LAMBDA_P_EFF:.3f}  (IVC {IVC_PHASE} + IVR {IVR_PHASE} phases only)")
 else:
     print(f"\n  Pressure correction inactive  (λ=0)")
@@ -656,7 +726,7 @@ if USE_ADAPTIVE_WEIGHTS:
     _row_norms = np.linalg.norm(_J_static_all, axis=2)          # (n_traj, 3)
     _row_max   = _row_norms.max(axis=0, keepdims=True) + 1e-8
     _adaptive_w = (_row_norms / _row_max) * (1 - SENSITIVITY_FLOOR) + SENSITIVITY_FLOOR
-    _adaptive_w = _adaptive_w * GEOM_WEIGHTS[None, :]
+    _adaptive_w = _adaptive_w * GEOM_WEIGHTS[None, :] * _traj_w_scale[None, :]
 
 _J_geom_all = _J_static_all   # no blending — SINDy smoothed is the geometry Jacobian
 
@@ -671,7 +741,6 @@ _lambda_hard = np.array([
     for p in traj_phase
 ])
 _lambda_envelope = gaussian_filter1d(_lambda_hard, sigma=PRESSURE_FADE_SIGMA, mode='wrap')
-# _lambda_envelope is now in [0,1] with smooth fades at every IVC/IVR boundary
 
 peak_lambda = _lambda_envelope.max()
 n_nonzero = int(np.sum(_lambda_envelope > 0.01))
@@ -679,9 +748,23 @@ print(f"  Pressure lambda envelope: peak={peak_lambda:.3f}  "
       f"non-trivial at {n_nonzero}/{n_traj} pts  "
       f"(IVC {IVC_PHASE} + IVR {IVR_PHASE}, fade σ={PRESSURE_FADE_SIGMA} samples)")
 
+# ── Shape-weighted error augmentation ────────────────────────────────────────
+# Add slope mismatch (adjacent-point derivative error) to the value error so
+# the ILC correction also fixes waveform dynamics, not just pointwise values.
+# Wrap-around at the cycle boundary keeps the signal continuous.
+if SHAPE_WEIGHT > 0:
+    _y_norm_meas  = norm_y(y_phys_avg)   # (n, 3) normalised measured
+    _e_slope_norm = np.zeros_like(e_norm)
+    for _i in range(n_traj):
+        _ip = (_i - 1) % n_traj
+        _des_slope  = traj_norm[_i]       - traj_norm[_ip]
+        _meas_slope = _y_norm_meas[_i]    - _y_norm_meas[_ip]
+        _e_slope_norm[_i] = _des_slope - _meas_slope
+    e_norm = e_norm + SHAPE_WEIGHT * _e_slope_norm
+
 for i in range(n_traj):
     J_geom = _J_geom_all[i]
-    geom_w_i = _adaptive_w[i] if USE_ADAPTIVE_WEIGHTS else GEOM_WEIGHTS
+    geom_w_i = _adaptive_w[i] if USE_ADAPTIVE_WEIGHTS else GEOM_WEIGHTS * _traj_w_scale
 
     # Smoothly-varying lambda — zero outside isovolumic phases, fades in/out
     # at boundaries so there are no discontinuities in the correction signal.
@@ -690,29 +773,11 @@ for i in range(n_traj):
     if lambda_i > 1e-6:
         J_pres = J_pres_at_phase(traj_phase[i], fourier_coeffs, N_FOURIER)
 
-        # Phase-specific geometry weights for the pressure-active phases.
-        # IVC and IVR are ISOVOLUMIC — volume is near-constant BY PHYSIOLOGICAL
-        # DEFINITION.  Keeping the volume weight non-zero during those phases
-        # forces the pseudoinverse to simultaneously protect something that isn't
-        # changing anyway, creating unnecessary conflict with pressure correction.
-        # Zero-weighting the physiologically-stationary outputs frees the
-        # corresponding degrees of freedom for pressure correction.
-        #
-        # IVC (0–4%): volume strictly constant → release volume constraint
-        #   geom_w: [twist, height, volume=0]
-        # IVR (42–44%): volume + height near-constant → release both
-        #   geom_w: [twist, height=0, volume=0]
-        #
-        # Note: no extra smoothing needed — the lambda_envelope Gaussian fade
-        # already smooths the pressure correction magnitude near the boundaries,
-        # so the hard weight switch at the window edges doesn't cause trajectory kinks.
-        phi_i = traj_phase[i]
-        if IVC_PHASE[0] <= phi_i <= IVC_PHASE[1]:
-            geom_w_p = geom_w_i * np.array([1.0, 1.0, 0.0])  # twist+height only
-        elif IVR_PHASE[0] <= phi_i <= IVR_PHASE[1]:
-            geom_w_p = geom_w_i * np.array([1.0, 0.0, 0.0])  # twist only
-        else:
-            geom_w_p = geom_w_i
+        # Full geometry weights at all phases — pressure induces passive deformation
+        # of height and volume even at IVC/IVR, so the ILC must keep tracking all
+        # outputs everywhere. Zeroing geometry weights at those phases created an
+        # underdetermined system and incorrectly ignored pressure-driven deformation.
+        geom_w_p = geom_w_i
 
         J_aug  = np.vstack([J_geom, lambda_i * J_pres])           # (4, 3)
         e_aug  = np.append(e_norm[i], e_p_norm[i])
@@ -724,7 +789,11 @@ for i in range(n_traj):
 
     J_w = J_aug * w_full[:, None]
     e_w = e_aug * w_full
-    delta_u_n[i] = ILC_ALPHA * np.linalg.pinv(J_w) @ e_w
+    delta_u_n[i] = ILC_ALPHA * np.linalg.pinv(J_w, rcond=1.0/SINDY_COND_MAX) @ e_w
+
+# Per-actuator alpha scaling — applied before clamping so the redistribution
+# logic sees already-damped corrections (trans won't donate an oversized residual).
+delta_u_n *= ACT_ALPHA_SCALE[None, :]
 
 # ── Hard cap + cross-actuator redistribution ──────────────────────────────────
 # When an actuator's correction is clamped (hits ±MAX_DELTA_U_MM), the output
@@ -745,9 +814,14 @@ for i in range(n_traj):
     if not free.any():
         continue
     J_i = _J_geom_all[i]                              # (3, 3)
-    e_residual = J_i @ delta_u_n_raw[i] - J_i @ delta_u_n[i]  # output error lost to clamping
-    J_free = J_i[:, free]                             # (3, n_free)
-    extra, _, _, _ = np.linalg.lstsq(J_free, e_residual, rcond=None)
+    e_residual = J_i @ delta_u_n_raw[i] - J_i @ delta_u_n[i]
+    # Weighted redistribution: scale J columns by actuator preference so
+    # the lstsq solution favours high-weight actuators (endo) over
+    # low-weight ones (trans).  Scale back afterwards.
+    w_free = REDIST_ACT_WEIGHTS[free]
+    J_free_w = J_i[:, free] * w_free[None, :]         # scale columns
+    extra_w, _, _, _ = np.linalg.lstsq(J_free_w, e_residual, rcond=None)
+    extra = extra_w * w_free                           # unscale
     delta_u_n[i, free] = np.clip(
         delta_u_n[i, free] + extra,
         -delta_u_max_n[free], delta_u_max_n[free]
@@ -755,8 +829,40 @@ for i in range(n_traj):
     n_redistributed += 1
 
 if n_clamped > 0:
-    print(f"  Correction cap: {n_clamped} actuator×phase entries clamped to ±{MAX_DELTA_U_MM} mm  "
-          f"({n_redistributed} phase pts had residual redistributed to free actuators)")
+    print(f"  Delta cap: {n_clamped} actuator×phase entries clamped to ±{MAX_DELTA_U_MM} mm  "
+          f"({n_redistributed} phase pts redistributed to free actuators)")
+
+# ── Physical limit redistribution ─────────────────────────────────────────────
+# The MAX_DELTA_U_MM cap handles large DELTAS, but the corrected POSITION can
+# still hit the physical actuator limits (ACT_MIN/ACT_MAX) if the current
+# measured trajectory is already near the boundary.  Detect these violations
+# at the delta level (before Q-filter) so the Q-filter smooths the redistributed
+# signal rather than creating kinks.
+_act_phys_proposed = denorm_act(act_n_avg + delta_u_n)            # (n, 3)
+_act_phys_limited  = np.clip(_act_phys_proposed,
+                              ACT_MIN.reshape(1,-1), ACT_MAX.reshape(1,-1))
+_phys_viol         = np.abs(_act_phys_proposed - _act_phys_limited) > 0.01  # (n,3) bool
+_delta_n_at_limit  = norm_act(_act_phys_limited) - act_n_avg      # (n,3) normalised
+
+n_phys_clamped = int(_phys_viol.sum())
+n_phys_redist  = 0
+if n_phys_clamped > 0:
+    for i in range(n_traj):
+        viol = _phys_viol[i]
+        if not viol.any(): continue
+        free = ~viol
+        if not free.any(): continue
+        J_i = _J_geom_all[i]
+        lost_delta = delta_u_n[i] - _delta_n_at_limit[i]
+        e_residual = J_i @ lost_delta
+        w_free     = REDIST_ACT_WEIGHTS[free]
+        J_free_w   = J_i[:, free] * w_free[None, :]
+        extra_w, _, _, _ = np.linalg.lstsq(J_free_w, e_residual, rcond=None)
+        delta_u_n[i, free] += extra_w * w_free
+        delta_u_n[i, viol]  = _delta_n_at_limit[i, viol]
+        n_phys_redist += 1
+    print(f"  Physical limit: {n_phys_clamped} actuator×phase entries hit ACT_MIN/ACT_MAX  "
+          f"({n_phys_redist} phase pts redistributed to free actuators)")
 
 v_k = act_n_avg + delta_u_n
 
@@ -869,11 +975,15 @@ for ci, (col, unit) in enumerate(zip(OUTPUT_NAMES, OUTPUT_UNITS)):
     ax.plot(traj_phase, y_phys_avg[:, ci],        'b--', lw=1.8, label='Measured')
     ax.plot(traj_phase, y_phys_corrected[:, ci],  'r-',  lw=1.5, label='FK predicted after ILC', alpha=0.8)
     rmse   = rmse_before[col]
+    r2     = r2_before[col]
     thresh = GEOMETRY_RMSE_THRESHOLD[col]
     ok     = rmse < thresh
     ax.set_ylabel(f'{col} ({unit})', fontsize=10)
-    ax.set_title(f'RMSE = {rmse:.3f} {unit}  [{"PASS" if ok else "FAIL"} < {thresh}]',
-                 fontsize=9, color='green' if ok else 'red')
+    ax.text(0.01, 0.02,
+            f'RMSE = {rmse:.3f} {unit}  [{"PASS" if ok else "FAIL"} < {thresh}]   r² = {r2:.3f}',
+            transform=ax.transAxes, fontsize=9, va='bottom',
+            color='green' if ok else 'red',
+            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1.5))
     ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
 if _COL_PRES:
@@ -892,18 +1002,69 @@ if _COL_PRES:
     ax_p.set_title(pres_label, fontsize=9, color='green' if p_ok else 'red')
     ax_p.legend(fontsize=8); ax_p.grid(True, alpha=0.3)
 
-# ── Right: actuator signals (rows 0-2) + regression info (row 3) ──────────────
+# ── Right: actuator signals (rows 0-2) + cross-actuator redistribution overlay
 motor_names = ['Epi', 'Trans', 'Endo']
+
+# Pre-compute redistribution data for visualisation
+# delta_u_n_raw = pre-ALL-caps; delta_u_n = post-ALL-redistributions
+_raw_corr_mm      = delta_u_n_raw * x_den[:3]                             # (n,3) pre-everything
+_final_corr_mm    = delta_u_n     * x_den[:3]                             # (n,3) post-all
+
+# Delta cap (MAX_DELTA_U_MM) — tracks which actuators hit the delta limit
+_was_delta_capped = np.abs(_raw_corr_mm) > MAX_DELTA_U_MM                 # (n,3)
+
+# Physical limit (_phys_viol computed during redistribution above)
+# _phys_viol = which (phase, actuator) pairs hit ACT_MIN/ACT_MAX
+
+# Final redistribution received = delta beyond the clamped portion
+_clamp_contrib = np.clip(_raw_corr_mm, -MAX_DELTA_U_MM, MAX_DELTA_U_MM)
+_redist_mm     = _final_corr_mm - _clamp_contrib
+_got_redist    = np.abs(_redist_mm) > 0.05                                # (n,3)
+
 for ci in range(3):
     ax2 = axes[ci, 1]
+
+    # Purple dotted: what the uncapped/unlimited raw ILC wanted
+    _act_raw = act_phys_avg[:, ci] + _raw_corr_mm[:, ci]
+    ax2.plot(traj_phase, _act_raw, color='purple', lw=1.0, ls=':',
+             alpha=0.55, label='Raw (pre-cap/limit)')
+
     ax2.plot(traj_phase, act_phys_avg[:, ci], 'b--', lw=1.8, label='Current')
     ax2.plot(traj_phase, act_phys_new[:, ci], 'r-',  lw=1.8, label='Corrected')
+
+    # Red shading: hit MAX_DELTA_U_MM delta cap (donor — correction too large)
+    if _was_delta_capped[:, ci].any():
+        ax2.fill_between(traj_phase, ACT_MIN[ci] - 2, ACT_MAX[ci] + 2,
+                         where=_was_delta_capped[:, ci],
+                         alpha=0.18, color='red', label='Delta cap hit (donor)')
+
+    # Orange shading: hit physical ACT_MIN/ACT_MAX limit (donor — position limited)
+    if _phys_viol[:, ci].any():
+        ax2.fill_between(traj_phase, ACT_MIN[ci] - 2, ACT_MAX[ci] + 2,
+                         where=_phys_viol[:, ci],
+                         alpha=0.25, color='orange', label='Physical limit hit (donor)')
+
+    # Green shading: received extra correction via redistribution from either cap
+    if _got_redist[:, ci].any():
+        ax2.fill_between(traj_phase,
+                         act_phys_avg[:, ci] + _clamp_contrib[:, ci],
+                         act_phys_new[:, ci],
+                         where=_got_redist[:, ci],
+                         alpha=0.30, color='limegreen', label='Received redistribution')
+
     ax2.axhline(ACT_MIN[ci], color='grey', lw=1, ls=':')
     ax2.axhline(ACT_MAX[ci], color='grey', lw=1, ls=':')
     delta = np.abs(act_phys_new[:, ci] - act_phys_avg[:, ci]).max()
-    ax2.set_title(f'Max |Δ| = {delta:.2f} mm', fontsize=9, color='grey')
+    n_dc   = int(_was_delta_capped[:, ci].sum())
+    n_pl   = int(_phys_viol[:, ci].sum())
+    n_rd   = int(_got_redist[:, ci].sum())
+    title_str = f'Max |Δ| = {delta:.2f} mm'
+    if n_dc: title_str += f'  🔴 Δcap@{n_dc}pts'
+    if n_pl: title_str += f'  🟠 lim@{n_pl}pts'
+    if n_rd: title_str += f'  🟢 +redist@{n_rd}pts'
+    ax2.set_title(title_str, fontsize=8, color='grey')
     ax2.set_ylabel(f'{motor_names[ci]} (mm)', fontsize=10)
-    ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=7); ax2.grid(True, alpha=0.3)
 
 if _COL_PRES and n_rows == 4:
     ax_r = axes[3, 1]

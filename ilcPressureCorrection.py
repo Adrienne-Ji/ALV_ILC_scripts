@@ -59,7 +59,7 @@ Q_ORDER    = 3
 ACT_MIN = np.array([200.0, 202.0, 200.0])
 ACT_MAX = np.array([248.0, 248.0, 248.0])
 
-HEIGHT_OFFSET = 70.0
+HEIGHT_OFFSET = 75.0
 VOLUME_OFFSET = 15.0
 
 ILC_MODEL = 'SINDy'      # static FK: 'DataDriven' | 'PINN' | 'SINDy' | 'SINDy2'

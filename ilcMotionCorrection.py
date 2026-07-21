@@ -53,7 +53,7 @@ Q_ORDER    = 3          # Q-filter Butterworth order
 ACT_MIN = np.array([200.0, 202.0, 200.0])   # epi, trans, endo lower bounds (mm)
 ACT_MAX = np.array([248.0, 248.0, 248.0])   # epi, trans, endo upper bounds (mm)
 
-HEIGHT_OFFSET = 70.0    # mm  — applied to desired height trajectory
+HEIGHT_OFFSET = 75.0    # mm  — applied to desired height trajectory
 VOLUME_OFFSET = 15.0    # mL  — applied to desired volume trajectory
 
 ILC_MODEL = 'SINDy'     # static FK for Jacobian: 'DataDriven', 'PINN', 'SINDy', 'SINDy2'

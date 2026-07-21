@@ -14,6 +14,8 @@ at ILCFiles/Exp_data/<SESSION_DIR>/<CASE>/.
 """
 
 import os, subprocess, sys
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -25,11 +27,12 @@ import matplotlib.pyplot as plt
 # are only used as fallback when it's run standalone, without this wrapper.)
 # ══════════════════════════════════════════════════════════════════════════════
 
-SESSION_DIR = '6_28'       # date folder — must match ilcCorrection.py's SESSION_DIR
-CASE        = 'healthy'    # 'healthy' | 'diastolic' | 'systolic' — must match SIM_CASE
+SESSION_DIR = '7_17'      # date folder — must match ilcCorrection_clean.py's SESSION_DIR
+CASE        = 'healthy'   # 'healthy' | 'diastolic' | 'systolic' — must match SIM_CASE
 
 # Tag appended to output filename — increment each iteration
-OUTPUT_TAG = 'P_iter2'    # e.g. 'iter1', 'iter2', '2026-06-02'
+OUTPUT_TAG = 'ite5'      # e.g. 'iter1', 'iter2', '2026-06-02'
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PATHS
@@ -44,7 +47,7 @@ print(f"Output folder for this experiment: {ILC_TRAJ}")
 ILC_CSV     = os.path.join(SHARED, 'ilc_corrected_actuators.csv')   # transient handoff
 PREV_CSV    = os.path.join(SHARED, 'ILCReadyData.csv')
 
-ILC_SCRIPT  = os.path.join(BASE, 'ilcCorrection.py')
+ILC_SCRIPT  = os.path.join(BASE, 'ilcCorrection_clean.py')
 PVT_SCRIPT  = os.path.join(PYTHONCODES, 'PVTwrite.py')
 OUT_CSV     = os.path.join(ILC_TRAJ, f'ILC_{OUTPUT_TAG}.csv')
 OUT_FIG     = os.path.join(ILC_TRAJ, f'ILC_{OUTPUT_TAG}_comparison.png')
@@ -121,23 +124,65 @@ new_epi   = df_out['epi'].values
 new_trans = df_out['trans'].values
 new_endo  = df_out['endo'].values
 
-fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+# ── Load desired deformation trajectory (from rig_config + engineered CSV) ──
+sys.path.insert(0, BASE)
+from rig_config import HEIGHT_OFFSET, VOLUME_OFFSET
+_ENGD = os.path.normpath(os.path.join(BASE, '..', '..', 'ILCFiles', 'Engineered_trajs'))
+_ENG_FILES = {
+    'healthy':   os.path.join(_ENGD, 'engineered_data_healthy.csv'),
+    'diastolic': os.path.join(_ENGD, 'engineered_data_diastolic_dysfunction.csv'),
+    'systolic':  os.path.join(_ENGD, 'engineered_data_systolic_dysfunction.csv'),
+}
+_eng_path = _ENG_FILES.get(CASE, _ENG_FILES['healthy'])
+_has_deform = False
+if os.path.exists(_eng_path) and os.path.exists(PREV_CSV):
+    try:
+        eng_df  = pd.read_csv(_eng_path)
+        eng_t   = eng_df['time'].values
+        eng_ph  = (eng_t - eng_t[0]) / (eng_t[-1] - eng_t[0])
+        des_tw  = eng_df['twist'].values
+        des_ht  = eng_df['height'].values + HEIGHT_OFFSET
+        des_vl  = eng_df['volume'].values + VOLUME_OFFSET
+        meas_tw = prev_df[_col(prev_df, ['twist','twist_deg'])].values  if _col(prev_df, ['twist','twist_deg']) else None
+        meas_ht = prev_df[_col(prev_df, ['height','height_mm'])].values if _col(prev_df, ['height','height_mm']) else None
+        meas_vl = prev_df[_col(prev_df, ['volume','volume_mL'])].values if _col(prev_df, ['volume','volume_mL']) else None
+        _has_deform = meas_tw is not None
+    except Exception:
+        _has_deform = False
+
+# ── Figure: actuator signals (top 3) + deformation tracking (bottom 3 if available)
+n_rows = 6 if _has_deform else 3
+fig, axes = plt.subplots(n_rows, 1, figsize=(11, 4 * n_rows), sharex=True)
+
 labels    = ['Epi (mm)', 'Trans (mm)', 'Endo (mm)']
 prev_sigs = [prev_epi,   prev_trans,   prev_endo]
 new_sigs  = [new_epi,    new_trans,    new_endo]
 
-for ax, label, prev, new in zip(axes, labels, prev_sigs, new_sigs):
+for ax, label, prev, new in zip(axes[:3], labels, prev_sigs, new_sigs):
     ax.plot(prev_phase, prev, color='steelblue',  lw=2.0, ls='--', label='Previous (ILCReadyData)')
     ax.plot(new_phase,  new,  color='darkorange', lw=2.0,          label=f'Corrected ({OUTPUT_TAG})')
     delta_max = np.abs(new - np.interp(new_phase, prev_phase, prev)).max()
     ax.set_ylabel(label, fontsize=10)
     ax.set_title(f'Max |Δ| = {delta_max:.2f} mm', fontsize=9, color='grey')
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
 
-axes[-1].set_xlabel('Cycle phase (normalised)', fontsize=10)
-plt.suptitle(f'ILC Actuator Correction — {OUTPUT_TAG}\n'
-             f'Previous signal vs corrected signal', fontsize=12)
+if _has_deform:
+    deform_labels = ['Twist (deg)', f'Height (mm)  [offset={HEIGHT_OFFSET}]',
+                     f'Volume (mL)  [offset={VOLUME_OFFSET}]']
+    desired_sigs  = [des_tw, des_ht, des_vl]
+    measured_sigs = [meas_tw, meas_ht, meas_vl]
+
+    for ax, label, des, meas in zip(axes[3:], deform_labels, desired_sigs, measured_sigs):
+        ax.plot(eng_ph,    des,  'k-',  lw=2.5, label=f'Desired ({CASE})')
+        ax.plot(prev_phase, np.interp(prev_phase, np.linspace(0,1,len(meas)), meas),
+                'b--', lw=1.8, label='Measured (current)')
+        ax.set_ylabel(label, fontsize=10); ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel('Cycle phase (normalised)', fontsize=10)
+else:
+    axes[-1].set_xlabel('Cycle phase (normalised)', fontsize=10)
+
+plt.suptitle(f'ILC Actuator Correction — {OUTPUT_TAG}  |  Case: {CASE}\n'
+             f'HEIGHT_OFFSET={HEIGHT_OFFSET} mm   VOLUME_OFFSET={VOLUME_OFFSET} mL', fontsize=12)
 plt.tight_layout()
 plt.savefig(OUT_FIG, dpi=150, bbox_inches='tight')
 print(f"  Comparison plot saved → {OUT_FIG}")

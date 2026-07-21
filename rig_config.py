@@ -18,7 +18,9 @@ they are a property of the current rig setup, not the desired trajectory.
 #   desired, increase this value.  Current: 75 mm (raised from 70 mm —
 #   measured was ~5 mm above desired, causing epi to saturate at 200 mm floor).
 #
-# VOLUME_OFFSET: analogous offset for volume.  Currently 0 (the rig's volume
-#   coordinate matches the engineered trajectory without additional shift).
-HEIGHT_OFFSET = 75.0   # mm
-VOLUME_OFFSET = 5.0    # mL
+# VOLUME_OFFSET: shifts the desired volume trajectory upward.  Set to +15 mL
+#   to move the minimum volume above the FK model's achievable floor at 120 mmHg
+#   (~68.5 mL).  Resulting range: healthy 75–135 mL (EF≈44%), systolic 99–135 mL
+#   (EF≈27%).  All within physiological RV range (EDV 100–160, ESV 30–100 mL).
+HEIGHT_OFFSET = 70.0   # mm — matched to 6_18 session
+VOLUME_OFFSET = 0.0    # mL
